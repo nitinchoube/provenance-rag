@@ -1,0 +1,5 @@
+chromadb==1.0.20
+httpx==0.28.1
+langgraph==1.2.16
+PyMuPDF==1.26.4
+streamlit==1.64.0

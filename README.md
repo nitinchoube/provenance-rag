@@ -1,0 +1,200 @@
+# Privacy First Local RAG
+
+A local web app for asking questions about private documents. Parsing, embeddings,
+retrieval, evidence assessment, answer drafting, and claim verification run on the machine
+hosting the app. Ollama is the only model service, and the application accepts only a loopback
+Ollama URL. There is no web search, cloud model client, or external model fallback.
+
+The workflow is a fixed acyclic LangGraph:
+
+```text
+validate → ACL-filtered retrieval → evidence assessment and cited draft
+         → citation and claim verification → answer
+```
+
+Invalid requests are rejected. Missing or low-scoring evidence, malformed model output,
+invalid citations, and unsupported claims all produce an abstention. Retrieved text is
+treated as untrusted data in every model prompt.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User[Local user] --> UI[Streamlit frontend<br/>127.0.0.1]
+
+    UI -->|Upload and access labels| Raw[data/raw]
+    Raw --> Parse[Local parsing and OCR]
+    Parse --> Chunk[Chunking with source metadata]
+    Chunk --> EmbedDocs[Local document embeddings]
+    EmbedDocs --> Index[(Chroma vector index)]
+
+    UI -->|Question| Identity[Resolve OS account groups]
+    Identity --> QueryEmbed[Local query embedding]
+    QueryEmbed --> Search[ACL-filtered retrieval]
+    Index --> Search
+    Search --> AssessDraft[Assess evidence and draft cited claims]
+    AssessDraft -->|Insufficient evidence| Abstain[Abstain]
+    AssessDraft -->|Sufficient evidence| Verify[Verify claims and citations]
+    Verify -->|Verified| Answer[Show answer and sources]
+    Verify -->|Not verified| Abstain
+    Abstain --> UI
+    Answer --> UI
+
+    Ollama[Ollama on loopback] -. local models .-> EmbedDocs
+    Ollama -. local models .-> QueryEmbed
+    Ollama -. local models .-> AssessDraft
+    Ollama -. local models .-> Verify
+```
+
+## Requirements
+
+- Python 3.11 or newer
+- Local [Ollama](https://ollama.com/) bound to `127.0.0.1:11434`
+- `nomic-embed-text` and a chat model that supports JSON schema output
+- Tesseract installed locally if scanned PDFs need OCR (the PDF path invokes it through
+  PyMuPDF; no OCR request leaves the machine)
+
+The configured example chat model is `granite4.1:3b`. Choose a model that fits the machine
+and check its answers against a human-reviewed golden set before using it for important
+decisions. Model-based verification is a useful filter, not a guarantee against hallucination.
+
+## Install and start
+
+Start Ollama and pull the configured model tags:
+
+```powershell
+ollama pull nomic-embed-text
+ollama pull granite4.1:3b
+```
+
+Keep Ollama bound to loopback for the current session:
+
+```powershell
+$env:OLLAMA_HOST = "127.0.0.1:11434"
+ollama serve
+```
+
+In another terminal, from the project root, install and configure the app:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+Copy-Item .env.example .env
+python -m pip install -r requirements.txt
+```
+
+The runtime dependency versions are pinned in `pyproject.toml`; `requirements.txt` installs
+the project in editable mode from that source. Edit `.env` to choose storage locations or a
+different already-installed local chat model. Then start the frontend from the project root:
+
+```powershell
+streamlit run src/privacy_rag/web.py
+```
+
+Open `http://127.0.0.1:8501`. The project Streamlit configuration binds to `127.0.0.1`,
+enables CORS and XSRF protection, and disables usage statistics. The UI refuses to run
+when Streamlit reports another bind address. Start it from the project root and do not
+override that address. Keep this a single-user local app: browser sessions use the OS
+account that started Streamlit, so it is not a multi-user network service.
+
+Privacy flags and framework tracing fail startup when enabled. Chroma telemetry is
+disabled in the local client, and the Ollama HTTP client ignores proxy environment
+variables and refuses redirects. Before using the model API, the app checks Ollama's
+local model inventory and refuses cloud-tagged or uninstalled models; it never downloads
+models automatically.
+
+For development, install the lint and type-check tools with `python -m pip install -e ".[dev]"`.
+Run the tests and static checks from the project root:
+
+```powershell
+python -m unittest discover -s tests -v
+ruff check src tests
+mypy
+```
+
+## Use the frontend
+
+The sidebar has three views:
+
+- **Ask** accepts a question and displays a verified answer with chunk citations and
+  source names/pages when available. Unsupported answers abstain. If a draft has invalid
+  evidence indexes, the app can fall back to a directly extracted source sentence; acronym
+  expansion questions prioritize explicit definitions in retrieved text. All claims still
+  pass local verification before they are shown.
+- **Add documents** accepts PDF, TXT, Markdown, and CSV files. Uploads are stored in
+  `data/raw`, checked against the configured byte limit, parsed locally, and indexed.
+- **Knowledge base** lists records available to the current OS account and can remove a
+  selected document from the active index. Removing an index record does not delete the
+  original upload from `data/raw`.
+
+By default, uploaded documents receive the `public` access label. Enter comma-separated
+labels such as `hr` or `finance, managers` when uploading restricted documents. Map OS
+accounts to labels in `.env`; every mapped account also receives `public`, while accounts
+not listed receive `public` only:
+
+```dotenv
+ACL_PRINCIPALS_JSON={"NITIN":["hr","managers"],"CORP\\alex":["finance"]}
+```
+
+The running app resolves groups from its OS account. It hashes each group label into a
+Chroma metadata field and includes an OR filter in the vector query itself. Document
+listing and deletion apply the same access filter. Keep `.env`, the vector store, and
+document directories under operating system access controls.
+
+Supported formats are PDF, TXT, Markdown, and CSV. Individual files are limited to
+25 MiB by default and parsed in a subprocess with a timeout, a 5 million character
+extraction ceiling, and a 1,000 page PDF ceiling. Uploaded originals are retained in
+`data/raw`; parsed artifacts under `data/processed` are optional and are not required by
+the current pipeline. Scanned PDFs use local OCR when `LOCAL_OCR=true`.
+
+The index uses the local OS account's trust boundary. Removing an item from the source
+folder does not automatically remove its index entry. Deletion removes records from the
+active Chroma collection; it does not claim secure block-level erasure from database
+journals, filesystem snapshots, or backups. Apply the machine's approved retention and
+backup policy to those storage layers.
+
+## Configuration
+
+All settings and safe defaults are in `.env.example`. The main retrieval settings are:
+
+- `CHUNK_SIZE=800` and `CHUNK_OVERLAP=120` count characters.
+- `TOP_K=5` is the maximum number of retrieved chunks.
+- `MIN_RELEVANCE_SCORE=0.65` is applied before evidence assessment.
+- `OLLAMA_NUM_CTX=8192` sets the local model context explicitly.
+- `OLLAMA_VERIFY_MODEL` can select a second local verifier model; empty reuses the chat model.
+- `MAX_FILE_BYTES=26214400` sets the per-file upload and parser limit.
+
+Tune thresholds on the target corpus. Chroma stores cosine distance, and this application
+reports similarity as `1 - distance`; benchmark thresholds are corpus and model dependent.
+
+## Measured evaluation
+
+Create a private JSONL file with one object per line, for example:
+
+```json
+{"question":"How many vacation days are provided?","should_answer":true,"expected_chunk_ids":["c_0123456789abcdef01234567"]}
+{"question":"What is the office on Mars like?","should_answer":false,"expected_chunk_ids":[]}
+```
+
+Run the evaluator after ingesting the corpus through the frontend:
+
+```powershell
+python .\benchmarks\evaluate.py --golden .\benchmarks\golden.jsonl
+```
+
+It reports measured answerable hit rate, abstention accuracy, expected citation recall,
+first-question and warm median/p95 latency. The run metadata records local model tags and
+quantization details, OS/processor, indexed document and chunk counts, index storage size,
+context length, chunking, top-k, and trial count. Record GPU and memory details alongside
+the output when relevant. No benchmark numbers are bundled or assumed.
+
+The application restricts its own model calls to loopback, but deployment egress controls
+should still be reviewed and checked with network monitoring on the target machine.
+
+## Limits
+
+The local process and its storage directories remain inside the machine's trust boundary.
+Protect those files with operating system permissions and backup controls. OCR quality
+depends on the local Tesseract installation. PDF tables, scans, and complex layouts can
+extract poorly, retrieval may miss evidence, and model-based grading and verification can
+make mistakes. Review consequential answers against their cited source chunks.
